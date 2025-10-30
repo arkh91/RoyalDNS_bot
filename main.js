@@ -11,7 +11,7 @@ const fs      = require('fs');
 const https   = require('https');
 const tokens  = require('./tokens');
 
-console.log("MySQL module loaded successfully");
+console.log("✅ MySQL module loaded successfully");
 
 // ───── Load / watch callbacks.json ───────────────────────────────────────
 let callbackToServer = {};
@@ -68,20 +68,20 @@ const subMenus = {
         reply_markup: {
             inline_keyboard: [
                 [
-                    { text: 'Germany', callback_data: 'speed_ger' },
-                    { text: 'Sweden', callback_data: 'speed_sweden' }
+                    { text: 'Germany 🇩🇪', callback_data: 'speed_ger' },
+                    { text: 'Sweden 🇸🇪', callback_data: 'speed_sweden' }
                 ],
                 [
-                    { text: 'Finland', callback_data: 'speed_fin' },
-                    { text: 'Italy',   callback_data: 'speed_it' }
+                    { text: 'Finland 🇫🇮 ', callback_data: 'speed_fin' },
+                    { text: 'Italy 🇮🇹 ',   callback_data: 'speed_it' }
                 ],
                 [
-                    { text: 'India',   callback_data: 'speed_in' },
-                    { text: 'UAE',     callback_data: 'speed_uae' }
+                    { text: 'India 🇮🇳 ',   callback_data: 'speed_in' },
+                    { text: 'UAE 🇦🇪 ',     callback_data: 'speed_uae' }
                 ],
                 [
-                    { text: 'UK',      callback_data: 'speed_uk' },
-                    { text: 'USA',     callback_data: 'speed_usa' }
+                    { text: 'UK 🇬🇧 ',      callback_data: 'speed_uk' },
+                    { text: 'USA 🇺🇸 ',     callback_data: 'speed_usa' }
                 ],
                 [{ text: '⬅️ Go Back', callback_data: 'menu_1' }]
             ]
@@ -244,10 +244,7 @@ bot.on('callback_query', async (query) => {
         // ── All Devices (IP-Based) ─────────────────────────────────────
         if (data === 'sub_alldevices') {
             await bot.editMessageText(
-                "**IP-Based DNS (All Devices)**\n\n" +
-                "Primary: `103.194.24.1`\n" +
-                "Secondary: `103.194.24.2`\n\n" +
-                "Works on PC, consoles, iOS, Android, routers.",
+                "⚠️ This section is under development. Please check back later.",
                 {
                     chat_id: chatId,
                     message_id: messageId,
