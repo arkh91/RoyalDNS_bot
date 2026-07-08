@@ -1,37 +1,35 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  keys.js  –  Create / validate / remove customer DNS keys
+//  keys.js  –  Create / validate / remove customer DNS keys (FILE-BASED)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-//  This is the piece that ties your Telegram bot's payment flow to the actual
-//  DNS server. A "key" is a random token stored in MySQL with an expiry date.
-//  Every customer connects to the SAME domain:port — the key in the URL PATH
-//  is what identifies and authorizes them, e.g.:
+//  This regional server has NO database — every key lives in a single JSON
+//  file on disk (keys-data.json). That's a deliberate choice: DNS query
+//  volume here is low enough that a file read per query is cheap, and it
+//  means this box has zero database attack surface and nothing to keep
+//  patched/secured beyond the OS itself. The ONE central database in this
+//  whole system lives on the main VPS, for its own bookkeeping — this file
+//  is the actual source of truth for whether a key is valid, right here on
+//  the box that's serving DNS queries.
 //
-//    https://dns.royalgaming.com:11111/a1A10A4qQmNCh3GgcL0e2w
+//  Every function below re-reads the file fresh rather than caching in
+//  memory, since doh-server.js, admin-api.js, and manage-keys.js are all
+//  SEPARATE processes that touch the same file — an in-memory cache in one
+//  process wouldn't see changes made by another. Writes are serialized
+//  within this process via a simple promise-chain lock (writeQueue) and use
+//  a write-to-temp-then-rename pattern so a crash mid-write can't corrupt
+//  the file. Cross-process write races (e.g. manage-keys.js and admin-api.js
+//  writing at the exact same instant) aren't fully guarded against — a real
+//  risk only under concurrent admin operations, not DNS query volume.
 //
-//  There is no per-customer subdomain. The DNS server checks incoming
-//  requests against this table on every query (see doh-server.js), and your
-//  bot calls createKey/removeKey when a purchase completes or is refunded.
-//
-//  ASSUMES: ./db.js exports a mysql2/promise-style pool with .query() or
-//  .execute() returning a Promise. Adjust the db.query(...) calls below to
-//  match whatever your db.js actually exports (e.g. if it's callback-style
-//  `mysql`, wrap it with util.promisify first).
-//
-//  Suggested table (run once):
-//    CREATE TABLE dns_keys (
-//      id INT AUTO_INCREMENT PRIMARY KEY,
-//      key_value VARCHAR(64) UNIQUE NOT NULL,
-//      telegram_id BIGINT NOT NULL,
-//      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-//      expires_at DATETIME NOT NULL,
-//      revoked TINYINT(1) DEFAULT 0
-//    );
+//  Suggested reading if you ever outgrow this: the moment regional write
+//  volume gets meaningful, look at SQLite (still a single file, but handles
+//  concurrent writers safely) before reaching back for a full DB server.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
+const fs     = require('fs');
+const path   = require('path');
 const crypto = require('crypto');
-const db = require('./db'); // your existing MySQL wrapper
 require('dotenv').config(); // loads .env written by setup.sh
 
 const DOMAIN   = process.env.DNS_DOMAIN;
@@ -41,100 +39,169 @@ if (!DOMAIN) {
     throw new Error('DNS_DOMAIN is not set — run setup.sh first, or set it in .env');
 }
 
+const DATA_DIR   = path.join(__dirname, 'data');
+const KEYS_FILE  = path.join(DATA_DIR, 'keys-data.json');
+
+// Serializes the ENTIRE read-modify-write cycle within this process, not
+// just the write — locking only the write step still lets two concurrent
+// calls both read the same stale snapshot and clobber each other's changes.
+let writeQueue = Promise.resolve();
+
 /**
- * Usage: call after a successful payment to issue a brand-new key.
- * Returns the key string and the URL the customer should paste into Intra
- * (or any other DoH client that takes a custom server URL).
+ * Usage: internal — reads the current keys file, returning {} if it
+ * doesn't exist yet (first run). Not exported; only called from inside
+ * withKeysFile() below, never on its own, so reads stay inside the lock.
  *
- *   const key = await createKey(msg.from.id, 30); // 30-day key
- *   bot.sendMessage(chatId, `Your DNS key: ${key.dohUrl}`);
+ *   const allKeys = readKeysFile();
+ */
+function readKeysFile() {
+    if (!fs.existsSync(KEYS_FILE)) return {};
+    const raw = fs.readFileSync(KEYS_FILE, 'utf8').trim();
+    return raw ? JSON.parse(raw) : {};
+}
+
+/**
+ * Usage: internal — writes atomically (temp file + rename) so a crash
+ * mid-write leaves the old file intact rather than a truncated one. Only
+ * ever called from inside withKeysFile(), already holding the lock.
+ *
+ *   writeKeysFileSync(updatedKeysObject);
+ */
+function writeKeysFileSync(data) {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmpFile = `${KEYS_FILE}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+    fs.renameSync(tmpFile, KEYS_FILE);
+}
+
+/**
+ * Usage: internal — the ONLY way any function below touches the file.
+ * Queues read+mutate+write as one atomic unit against a process-wide chain,
+ * so concurrent createKey/removeKey/purgeExpiredKeys calls can't interleave
+ * and lose each other's changes (this is the fix for a real bug: locking
+ * only the write step still let two concurrent reads see the same stale
+ * snapshot). `mutatorFn(allKeys)` mutates the object in place and returns
+ * whatever the caller should get back.
+ *
+ *   const result = await withKeysFile((allKeys) => {
+ *       allKeys[newKey] = { ... };
+ *       return { key: newKey };
+ *   });
+ */
+function withKeysFile(mutatorFn) {
+    const task = writeQueue.then(() => {
+        const allKeys = readKeysFile();
+        const result = mutatorFn(allKeys);
+        writeKeysFileSync(allKeys);
+        return result;
+    });
+    // Keep the queue moving even if this task threw — swallow here so a
+    // failed operation doesn't jam every future one, but the caller still
+    // sees their own rejection via `task` (returned below, not `writeQueue`).
+    writeQueue = task.then(() => undefined, () => undefined);
+    return task;
+}
+
+/**
+ * Usage: call after a successful payment to issue a brand-new key. Returns
+ * the key string and the URL the customer should paste into Intra.
+ *
+ *   const issued = await createKey(123456789, 30); // 30-day key
+ *   console.log(issued.dohUrl);
  */
 async function createKey(telegramId, durationDays) {
-    // base64url gives a mixed-case, URL-safe token, e.g. "a1A10A4qQmNCh3GgcL0e2w".
     const keyValue = crypto.randomBytes(16).toString('base64url');
     const expiresAt = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000);
 
-    await db.query(
-        'INSERT INTO dns_keys (key_value, telegram_id, expires_at) VALUES (?, ?, ?)',
-        [keyValue, telegramId, expiresAt]
-    );
+    await withKeysFile((allKeys) => {
+        allKeys[keyValue] = {
+            telegramId,
+            createdAt: new Date().toISOString(),
+            expiresAt: expiresAt.toISOString(),
+            revoked: false
+        };
+    });
 
     return {
         key: keyValue,
         expiresAt,
-        // Path-based form: https://dns.royalgaming.com:11111/a1A10A4qQmNCh3GgcL0e2w
-        // The key lives in the URL PATH, not a query string, so it reads as
-        // a single opaque per-customer endpoint — this is what goes into
-        // Intra's "Custom Server" field.
         dohUrl: `https://${DOMAIN}:${DOH_PORT}/${keyValue}`
     };
 }
 
 /**
  * Usage: call when a subscription is cancelled, refunded, or you need to
- * kill a key immediately (e.g. abuse). Soft-deletes by default so you keep
- * history; pass hardDelete=true to actually remove the row. Returns true if
- * a key was actually found and changed, false if nothing matched (e.g. a
- * typo, or a key that was already removed) — callers should check this
- * rather than assume success.
+ * kill a key immediately. Soft-deletes by default so you keep history;
+ * pass hardDelete=true to actually remove the entry. Returns true if a key
+ * was actually found and changed, false if nothing matched.
  *
  *   const removed = await removeKey('a1A10A4qQmNCh3GgcL0e2w');
- *   if (!removed) console.warn('No such key');
  */
 async function removeKey(keyValue, hardDelete = false) {
-    const result = hardDelete
-        ? await db.query('DELETE FROM dns_keys WHERE key_value = ?', [keyValue])
-        : await db.query('UPDATE dns_keys SET revoked = 1 WHERE key_value = ?', [keyValue]);
-    return result.affectedRows > 0;
+    return withKeysFile((allKeys) => {
+        if (!allKeys[keyValue]) return false;
+        if (hardDelete) {
+            delete allKeys[keyValue];
+        } else {
+            allKeys[keyValue].revoked = true;
+        }
+        return true;
+    });
 }
 
 /**
  * Usage: called by the DNS server on every incoming query to decide whether
- * to resolve it or reject with an error. Returns true/false.
+ * to resolve it or reject with an error. Returns true/false. Reads directly
+ * rather than going through withKeysFile's queue — this runs on every DNS
+ * query and shouldn't wait behind admin operations, and a plain read is
+ * safe here since writeKeysFileSync's temp-file-then-rename means a
+ * concurrent read only ever sees a fully old or fully new file, never a
+ * torn one.
  *
  *   if (!(await isKeyValid(req.params.key))) return res.status(403).end();
  */
 async function isKeyValid(keyValue) {
-    const rows = await db.query(
-        'SELECT expires_at, revoked FROM dns_keys WHERE key_value = ?',
-        [keyValue]
-    );
-    if (!rows || rows.length === 0) return false;
-    const row = rows[0];
-    if (row.revoked) return false;
-    return new Date(row.expires_at) > new Date();
-}
-
-/**
- * Usage: run on a daily cron to purge/flag keys that expired long ago, so
- * your table (and your "My Keys" menu) doesn't grow unbounded.
- *
- *   await purgeExpiredKeys(90); // delete keys expired more than 90 days ago
- */
-async function purgeExpiredKeys(graceDays = 90) {
-    await db.query(
-        'DELETE FROM dns_keys WHERE expires_at < DATE_SUB(NOW(), INTERVAL ? DAY)',
-        [graceDays]
-    );
+    const allKeys = readKeysFile();
+    const entry = allKeys[keyValue];
+    if (!entry || entry.revoked) return false;
+    return new Date(entry.expiresAt) > new Date();
 }
 
 /**
  * Usage: returns every key with its computed status, for admin/listing use
  * (manage-keys.js's "list" command and the admin API's GET /list both call
- * this, so the status logic — active/expired/revoked — lives in one place).
+ * this).
  *
  *   const all = await listKeys();
- *   all.forEach(k => console.log(k.key_value, k.status));
  */
 async function listKeys() {
-    const rows = await db.query(
-        'SELECT key_value, telegram_id, created_at, expires_at, revoked FROM dns_keys ORDER BY created_at DESC'
-    );
+    const allKeys = readKeysFile();
     const now = new Date();
-    return rows.map((row) => ({
-        ...row,
-        status: row.revoked ? 'revoked' : new Date(row.expires_at) < now ? 'expired' : 'active'
+    return Object.entries(allKeys).map(([keyValue, entry]) => ({
+        key_value: keyValue,
+        telegram_id: entry.telegramId,
+        created_at: entry.createdAt,
+        expires_at: entry.expiresAt,
+        revoked: entry.revoked,
+        status: entry.revoked ? 'revoked' : new Date(entry.expiresAt) < now ? 'expired' : 'active'
     }));
 }
 
-module.exports = { createKey, removeKey, isKeyValid, purgeExpiredKeys, listKeys };
+/**
+ * Usage: run on a daily cron to purge keys that expired long ago, so the
+ * file doesn't grow unbounded.
+ *
+ *   await purgeExpiredKeys(90); // delete keys expired more than 90 days ago
+ */
+async function purgeExpiredKeys(graceDays = 90) {
+    await withKeysFile((allKeys) => {
+        const cutoff = Date.now() - graceDays * 24 * 60 * 60 * 1000;
+        for (const [keyValue, entry] of Object.entries(allKeys)) {
+            if (new Date(entry.expiresAt).getTime() < cutoff) {
+                delete allKeys[keyValue];
+            }
+        }
+    });
+}
+
+module.exports = { createKey, removeKey, isKeyValid, listKeys, purgeExpiredKeys };
