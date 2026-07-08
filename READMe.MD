@@ -1,79 +1,76 @@
-# Royal DNS — regional server files
+Royal DNS — server files
 
-This is the complete, current set of files needed to stand up **one regional
-DNS VPS** (DoH server + local key management, no Telegram bot). The bot
-(`main.js`) is included too, but only runs on the **main VPS** — see the note
-at the bottom.
+There are two roles, each with its own setup script and its own set of
+files. Don't mix them onto the same box unless you really mean to.
 
-## Files
+No regional server has a database of any kind. Keys live in a local
+JSON file on each regional server (fast, zero database attack surface, and
+fine given DNS query volume here). The only database in the whole
+system is a local MySQL instance on the main VPS — and even that one never
+accepts a connection from anywhere but itself; it's purely a bookkeeping
+record of every key ever issued, not what decides whether a key is valid
+right now.
 
-| File | Purpose |
-|---|---|
-| `setup.sh` | Run once on a fresh Ubuntu server. Asks for domain + two ports (DoH, admin API), installs Node/MySQL/deps, opens the firewall, requests the TLS cert, and installs systemd services + a daily renewal timer. Prints a summary banner with the admin token and ready-to-run curl examples. |
-| `tls.js` | Issues/renews a single-hostname Let's Encrypt certificate (HTTP-01, no wildcard needed). |
-| `keys.js` | `createKey` / `removeKey` / `isKeyValid` / `listKeys` / `purgeExpiredKeys` — the core key lifecycle, backed by MySQL. |
-| `doh-server.js` | The actual DoH listener. Every customer hits `https://yourdomain:port/<key>` — the key in the path is what authorizes them. |
-| `admin-api.js` | Bearer-token-protected HTTP API (`/create`, `/remove`, `/list`) for the main VPS to manage keys on this server remotely, instead of SSHing in. |
-| `db.js` | Thin MySQL pool wrapper matching what `keys.js` expects. |
-| `manage-keys.js` | CLI to create/remove/list keys locally on this VPS — useful for testing, or if you'd rather not go through the API. |
-| `main.js` | The Telegram bot. **Only runs on the main VPS**, not on regional servers. |
-| `tokens.example.js` | Template for `tokens.js` (holds the real bot token — never share the real one). |
-| `test/test-dns.sh`, `test/test-dns.js` | Smoke tests: cert validity, key rejection/acceptance, latency. |
-| `ANDROID_SETUP.md` | What to send Android/Intra users, and why there's no true one-tap link. |
+Regional DNS server (one per country/location)
 
-## Deploying a new regional VPS
+Run setup.sh here. Files it needs:
 
-```
-# 1. Copy every file above onto the fresh server (same directory, e.g. /root)
-# 2. Make your own tokens.js and callbacks.json if this box will ever run the bot —
-#    skip both if it's regional-only (doh-server + manage-keys don't need them)
-cp tokens.example.js tokens.js   # only if running the bot here
-vi tokens.js                     # paste the real token, only if running the bot here
-echo '{"callbackToServer": {}, "callbackToInternationalServer": {}}' > callbacks.json  # same
+FilePurposesetup.shRun once. Asks for domain + two ports (DoH, admin API), installs Node/deps (no MySQL), opens the firewall, requests the TLS cert, installs royaldns-server + royaldns-admin systemd services + a daily renewal timer.tls.jsIssues/renews a single-hostname Let's Encrypt certificate (HTTP-01, no wildcard needed).keys.jscreateKey / removeKey / isKeyValid / listKeys / purgeExpiredKeys — reads/writes a local JSON file (./data/keys-data.json). No database. Writes are serialized in-process to avoid lost updates from concurrent requests.doh-server.jsThe actual DoH listener. Every customer hits https://yourdomain:port/<key> — the key in the path is what authorizes them, checked against the local file on every query.admin-api.jsBearer-token-protected HTTP API (/create, /remove, /list) that the main VPS calls remotely.manage-keys.jsCLI to create/remove/list keys locally on this VPS — same file, same functions admin-api.js uses, just from the command line.test/test-dns.sh, test/test-dns.jsSmoke tests: cert validity, key rejection/acceptance, latency.ANDROID_SETUP.mdWhat to send Android/Intra users, and why there's no true one-tap link.
 
-# 3. Run setup
+Ignore on a regional server: main.js, setup-main.sh, db.js, tokens.js/tokens.example.js, callbacks.json, regions.js/regions.example.js.
+
+Main VPS (one, runs the bot)
+
+Run setup-main.sh here instead. Files it needs:
+
+FilePurposesetup-main.shRun once. Installs Node + the packages main.js/db.js need, AND a local-only MySQL for bookkeeping. Never opens a firewall port for it — nothing outside this box ever needs to reach it.main.jsThe Telegram bot. Calls each regional server's admin-api.js over HTTPS to actually create/remove keys, then logs the result into the local bookkeeping DB.db.jsMySQL wrapper for the local issued_keys bookkeeping table (support/audit records — not what enforces key validity).tokens.example.js → copy to tokens.jsHolds the real Telegram bot token. Never share the real one.regions.example.js → copy to regions.jsMaps each country button (speed_ger, speed_usa, etc.) to that regional server's { domain, adminPort, adminToken }. Fill in one entry per regional server you've actually set up — anything left out just makes the bot tell customers that country is "temporarily unavailable" instead of crashing.callbacks.jsonMinimum viable: {"callbackToServer": {}, "callbackToInternationalServer": {}}.
+
+Ignore on the main VPS: setup.sh, tls.js, keys.js, doh-server.js, admin-api.js, manage-keys.js, test/*.
+
+Deploying the main VPS
+
+# 1. Copy the main-VPS files (see table above) onto the fresh server
+cp tokens.example.js tokens.js
+vi tokens.js       # paste your real Telegram bot token
+cp regions.example.js regions.js
+vi regions.js      # fill in as you add regional servers below
+echo '{"callbackToServer": {}, "callbackToInternationalServer": {}}' > callbacks.json
+
+# 2. Run setup
+chmod +x setup-main.sh
+sudo ./setup-main.sh
+
+# 3. Test
+journalctl -u royaldns-bot -f
+
+Deploying a new regional VPS
+
+# 1. Copy the regional files (see table above) onto the fresh server
 chmod +x setup.sh
 sudo ./setup.sh
-# → asks for domain, port, MySQL creds
-# → installs everything, opens firewall, gets a cert, starts royaldns-server
+# → asks for domain and two ports only — no database questions at all
+# → installs everything, opens firewall, gets a cert, starts both services
+# → prints a banner with the admin token
 
-# 4. If this box should NOT run the bot (regional servers), stop it:
-systemctl stop royaldns-bot
-systemctl disable royaldns-bot
+# 2. Copy this server's domain/adminPort/adminToken from its banner into
+#    the main VPS's regions.js (under the right country key), then restart
+#    the bot: systemctl restart royaldns-bot
 
-# 5. Test
+# 3. Test
 node manage-keys.js create <telegram-id> 30
-./test/test-dns.sh <domain> <port> <the-key-from-step-5>
-```
+./test/test-dns.sh <domain> <doh-port> <the-key-from-step-3>
 
-## Main VPS vs. regional VPS
+Admin API reference (regional servers)
 
-- **Regional VPS** (this set, minus the bot): runs `royaldns-server`
-  (`doh-server.js`) and `royaldns-admin` (`admin-api.js`). `royaldns-bot`
-  should be stopped/disabled here.
-- **Main VPS**: runs `royaldns-bot` (`main.js`), which is what customers talk
-  to on Telegram. To issue/revoke a key on a specific regional server, the
-  bot calls that server's admin API — e.g. when the bot's country-selection
-  step picks "Germany", it calls the German regional VPS's `/create`
-  endpoint with the bearer token for that server. Each regional server has
-  its own token (from its own `setup.sh` run) — the main VPS needs to keep a
-  small mapping of `country → { domain, port, token }` to know which server
-  to call. That mapping isn't built yet; it lives wherever `main.js` decides
-  which regional server a customer's chosen country maps to.
+All endpoints require Authorization: Bearer <token> (from that server's
+setup banner or .env's ADMIN_TOKEN), except /health.
 
-## Admin API reference
-
-All three endpoints require `Authorization: Bearer <token>` (from the setup
-banner or `.env`'s `ADMIN_TOKEN`), except `/health`.
-
-```
 POST /create   { "telegramId": 123456789, "days": 30 }   → { key, expiresAt, dohUrl }
 POST /remove   { "key": "...", "hard": false }           → { removed: true, key, hard }
 GET  /list                                                → [{ key_value, telegram_id, expires_at, status, ... }]
 GET  /health                                              → { status: "ok" }  (no auth needed)
-```
 
-`/remove` returns HTTP 404 (not a silent 200) if the key doesn't exist, so
+/remove returns HTTP 404 (not a silent 200) if the key doesn't exist, so
 the calling bot can tell "revoked" from "already gone".
 
 
@@ -88,23 +85,28 @@ mkdir -p main-vps && cp main.js regions.example.js tokens.example.js setup-main.
 ## Regional:
 
 ```
-mkdir -p regional && cp tls.js keys.js doh-server.js admin-api.js db.js manage-keys.js setup.sh ANDROID_SETUP.md regional/ && cp -r test regional/
+mkdir -p RoyalVPN && cd RoyalVPN
+wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/tls.js
+wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/keys.js
+wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/doh-server.js
+
+tls.js, keys.js, doh-server.js, admin-api.js, db.js	❌ ignore	✅
+manage-keys.js	❌ ignore	✅
+setup.sh, test/*
+
 ```
 
-## Reference
+Reference
 
-| File | Main VPS | Regional VPS |
-|---|---|---|
-| `main.js` | ✅ | ❌ ignore |
-| `regions.js` (new, below) | ✅ | ❌ ignore |
-| `tokens.js` | ✅ | ❌ ignore |
-| `callbacks.json` | ✅ | ❌ ignore |
-| `tls.js`, `keys.js`, `doh-server.js`, `admin-api.js`, `db.js` | ❌ ignore | ✅ |
-| `manage-keys.js` | ❌ ignore | ✅ |
-| `setup.sh`, `test/*` | ❌ ignore | ✅ |
+FileMain VPSRegional VPSmain.js✅❌ ignoredb.js✅ (local bookkeeping only)❌ ignoreregions.js (new, below)✅❌ ignoretokens.js✅❌ ignorecallbacks.json✅❌ ignoretls.js, keys.js, doh-server.js, admin-api.js❌ ignore✅manage-keys.js❌ ignore✅setup.sh, test/*❌ ignore✅
 
-Note: `regions.js`, `tokens.js`, and `callbacks.json` aren't copied by the
+Note: regions.js, tokens.js, and callbacks.json aren't copied by the
 command above since they don't exist yet as real files — they're created
-from templates (`regions.example.js`, `tokens.example.js`) or from scratch
-(`callbacks.json`), each holding secrets/config specific to your setup. See
-`README.md` for the exact commands to create them inside `main-vps/`.
+from templates (regions.example.js, tokens.example.js) or from scratch
+(callbacks.json), each holding secrets/config specific to your setup. See
+README.md for the exact commands to create them inside main-vps/.
+
+Note: db.js moved — it used to be a regional file (talking to a shared
+remote database) and is now a main-VPS-only file (talking to a purely local
+one). Regional servers have no database at all anymore; keys.js there
+reads/writes a local JSON file instead.
