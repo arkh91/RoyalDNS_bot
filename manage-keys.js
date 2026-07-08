@@ -2,11 +2,11 @@
 //  manage-keys.js  –  CLI for creating/removing keys locally on this VPS
 // ─────────────────────────────────────────────────────────────────────────────
 //
-//  This lets you test key issuance/revocation on a regional server WITHOUT
-//  running the Telegram bot here — the bot only runs on your main VPS. Once
-//  the main VPS is ready to control regional servers remotely, this is the
-//  logic that an admin API endpoint would call instead of a human typing
-//  commands — same createKey/removeKey functions either way.
+//  Same underlying keys.js functions admin-api.js calls remotely — this is
+//  just a local command-line way to do the same thing without going
+//  through HTTP, handy for testing or fixing something by hand on the box.
+//  No database involved (see keys.js) — everything reads/writes a local
+//  JSON file.
 //
 //  Usage:
 //    node manage-keys.js create <telegram-id> <days>
@@ -22,7 +22,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 const keys = require('./keys');
-const db = require('./db');
 
 const [, , command, ...args] = process.argv;
 
@@ -71,9 +70,9 @@ async function runRemove([keyValue, flag]) {
 }
 
 /**
- * Usage: internal — lists every key in the table with its status, so you
- * can eyeball what's active/expired/revoked without a MySQL client. Called
- * when command is "list".
+ * Usage: internal — lists every key with its status, so you can eyeball
+ * what's active/expired/revoked without opening the JSON file by hand.
+ * Called when command is "list".
  *
  *   await runList();
  */
@@ -84,14 +83,14 @@ async function runList() {
         return;
     }
     for (const row of rows) {
-        console.log(`${row.key_value}  telegram=${row.telegram_id}  expires=${row.expires_at.toISOString()}  [${row.status.toUpperCase()}]`);
+        console.log(`${row.key_value}  telegram=${row.telegram_id}  expires=${row.expires_at}  [${row.status.toUpperCase()}]`);
     }
 }
 
 /**
  * Usage: entry point — dispatches to the right handler based on the first
- * CLI argument, then exits cleanly (closing the MySQL pool so the process
- * doesn't hang open).
+ * CLI argument. No cleanup needed on exit (file-based storage, no
+ * persistent connections to close).
  */
 async function main() {
     if (command === 'create') await runCreate(args);
@@ -104,7 +103,6 @@ async function main() {
         console.error('  node manage-keys.js list');
         process.exit(1);
     }
-    await db.pool.end();
 }
 
 main().catch((err) => {
