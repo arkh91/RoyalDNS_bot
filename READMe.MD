@@ -75,3 +75,36 @@ GET  /health                                              → { status: "ok" }  
 
 `/remove` returns HTTP 404 (not a silent 200) if the key doesn't exist, so
 the calling bot can tell "revoked" from "already gone".
+
+
+# File separation — Main VPS vs Regional VPS
+
+## Main VPS:
+
+```
+mkdir -p main-vps && cp main.js regions.example.js tokens.example.js setup-main.sh main-vps/
+```
+
+## Regional:
+
+```
+mkdir -p regional && cp tls.js keys.js doh-server.js admin-api.js db.js manage-keys.js setup.sh ANDROID_SETUP.md regional/ && cp -r test regional/
+```
+
+## Reference
+
+| File | Main VPS | Regional VPS |
+|---|---|---|
+| `main.js` | ✅ | ❌ ignore |
+| `regions.js` (new, below) | ✅ | ❌ ignore |
+| `tokens.js` | ✅ | ❌ ignore |
+| `callbacks.json` | ✅ | ❌ ignore |
+| `tls.js`, `keys.js`, `doh-server.js`, `admin-api.js`, `db.js` | ❌ ignore | ✅ |
+| `manage-keys.js` | ❌ ignore | ✅ |
+| `setup.sh`, `test/*` | ❌ ignore | ✅ |
+
+Note: `regions.js`, `tokens.js`, and `callbacks.json` aren't copied by the
+command above since they don't exist yet as real files — they're created
+from templates (`regions.example.js`, `tokens.example.js`) or from scratch
+(`callbacks.json`), each holding secrets/config specific to your setup. See
+`README.md` for the exact commands to create them inside `main-vps/`.
