@@ -9,7 +9,15 @@ mkdir -p main-vps && cp main.js db.js regions.example.js tokens.example.js setup
 ## Regional:
 
 ```
-mkdir -p regional && cp tls.js keys.js doh-server.js admin-api.js manage-keys.js setup.sh ANDROID_SETUP.md regional/ && cp -r test regional/
+mkdir -p RoyalVPN && cd RoyalVPN
+wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/setup.sh && chmod +x setup.sh
+wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/tls.js
+wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/keys.js
+wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/doh-server.js && chmod +x admin-api.js
+wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/admin-api.js && chmod +x admin-api.js
+wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/manage-keys.js && chmod +x manage-keys.js
+wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/test-dns.sh && chmod +x test-dns.sh
+wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/test-dns.js && chmod +x test-dns.js
 ```
 
 ## Reference — every file, accounted for
