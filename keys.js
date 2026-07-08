@@ -73,17 +73,19 @@ async function createKey(telegramId, durationDays) {
 /**
  * Usage: call when a subscription is cancelled, refunded, or you need to
  * kill a key immediately (e.g. abuse). Soft-deletes by default so you keep
- * history; pass hardDelete=true to actually remove the row.
+ * history; pass hardDelete=true to actually remove the row. Returns true if
+ * a key was actually found and changed, false if nothing matched (e.g. a
+ * typo, or a key that was already removed) — callers should check this
+ * rather than assume success.
  *
- *   await removeKey('a1A10A4qQmNCh3GgcL0e2w');
- *   await removeKey('a1A10A4qQmNCh3GgcL0e2w', true); // permanently delete
+ *   const removed = await removeKey('a1A10A4qQmNCh3GgcL0e2w');
+ *   if (!removed) console.warn('No such key');
  */
 async function removeKey(keyValue, hardDelete = false) {
-    if (hardDelete) {
-        await db.query('DELETE FROM dns_keys WHERE key_value = ?', [keyValue]);
-    } else {
-        await db.query('UPDATE dns_keys SET revoked = 1 WHERE key_value = ?', [keyValue]);
-    }
+    const result = hardDelete
+        ? await db.query('DELETE FROM dns_keys WHERE key_value = ?', [keyValue])
+        : await db.query('UPDATE dns_keys SET revoked = 1 WHERE key_value = ?', [keyValue]);
+    return result.affectedRows > 0;
 }
 
 /**
@@ -116,4 +118,23 @@ async function purgeExpiredKeys(graceDays = 90) {
     );
 }
 
-module.exports = { createKey, removeKey, isKeyValid, purgeExpiredKeys };
+/**
+ * Usage: returns every key with its computed status, for admin/listing use
+ * (manage-keys.js's "list" command and the admin API's GET /list both call
+ * this, so the status logic — active/expired/revoked — lives in one place).
+ *
+ *   const all = await listKeys();
+ *   all.forEach(k => console.log(k.key_value, k.status));
+ */
+async function listKeys() {
+    const rows = await db.query(
+        'SELECT key_value, telegram_id, created_at, expires_at, revoked FROM dns_keys ORDER BY created_at DESC'
+    );
+    const now = new Date();
+    return rows.map((row) => ({
+        ...row,
+        status: row.revoked ? 'revoked' : new Date(row.expires_at) < now ? 'expired' : 'active'
+    }));
+}
+
+module.exports = { createKey, removeKey, isKeyValid, purgeExpiredKeys, listKeys };
