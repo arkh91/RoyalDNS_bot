@@ -1,15 +1,21 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  db.js  –  MySQL connection pool, wrapped to match keys.js's expectations
+//  db.js  –  Local bookkeeping database wrapper (MAIN VPS ONLY)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-//  Uses mysql2/promise (already installed by setup.sh). Note the unwrap in
-//  query(): mysql2's pool.query() resolves to a [rows, fields] tuple, but
-//  keys.js calls `const rows = await db.query(...)` expecting rows directly
-//  — this wrapper does that unwrapping once, here, so every caller stays
-//  simple.
+//  This file only belongs on the main VPS. It connects to the local MySQL
+//  instance that setup-main.sh installs (DB_HOST=127.0.0.1 always — this is
+//  never reached over the network by anything, including regional
+//  servers). Regional servers have no database at all; see their keys.js
+//  for the file-based key storage they use instead.
+//
+//  What this database is FOR: a record of every key ever issued, across
+//  every region, for support/audit/analytics purposes (e.g. a future "My
+//  Keys" bot menu). It is NOT what decides whether a key is currently
+//  valid — that's each regional server's own local file, checked on every
+//  DNS query without a network round-trip.
 //
 //  Reads connection details from .env (DB_HOST, DB_NAME, DB_USER, DB_PASS),
-//  the same file setup.sh already wrote — nothing new to configure.
+//  written by setup-main.sh.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const mysql = require('mysql2/promise');
@@ -28,11 +34,10 @@ const pool = mysql.createPool({
 /**
  * Usage: run any SQL statement with placeholders. Returns just the rows
  * (or the result metadata for INSERT/UPDATE/DELETE), not the raw mysql2
- * [rows, fields] tuple — this is what keys.js and any future code should
- * call directly.
+ * [rows, fields] tuple.
  *
- *   const rows = await query('SELECT * FROM dns_keys WHERE key_value = ?', [key]);
- *   await query('INSERT INTO dns_keys (key_value, telegram_id, expires_at) VALUES (?, ?, ?)', [k, id, exp]);
+ *   const rows = await query('SELECT * FROM issued_keys WHERE telegram_id = ?', [id]);
+ *   await query('INSERT INTO issued_keys (key_value, telegram_id, region, expires_at) VALUES (?, ?, ?, ?)', [k, id, region, exp]);
  */
 async function query(sql, params = []) {
     const [rows] = await pool.query(sql, params);
