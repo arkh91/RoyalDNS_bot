@@ -4,9 +4,10 @@
 # -----------------------------------------------------------------------------
 #
 #  Run this ONCE on a fresh Ubuntu server (root or sudo) before deploying
-#  tls.js / keys.js / doh-server.js. Asks for your domain and a port, then
-#  installs everything and gets the box ready to serve DoH and issue/revoke
-#  keys. Generated keys look like:
+#  tls.js / keys.js / doh-server.js / admin-api.js. Asks for your domain and
+#  two ports (DoH + admin API), then installs everything and gets the box
+#  ready to serve DoH, issue/revoke keys locally, and issue/revoke keys
+#  remotely via a bearer-token-protected API. Generated keys look like:
 #    https://dns.royalgaming.com:11111/a1A10A4qQmNCh3GgcL0e2w
 #  which is what you hand to Intra (Android) users. Windows/iPhone/Mac
 #  clients are a separate step - come back to this once Android works.
@@ -30,7 +31,7 @@ ENV_FILE=".env"
 # -----------------------------------------------------------------------------
 check_required_files() {
     local missing=()
-    for f in tls.js keys.js doh-server.js; do
+    for f in tls.js keys.js doh-server.js admin-api.js; do
         [ -f "$f" ] || missing+=("$f")
     done
     if [ "${#missing[@]}" -gt 0 ]; then
@@ -115,6 +116,41 @@ prompt_for_port() {
 }
 
 # -----------------------------------------------------------------------------
+# Usage: prompts for the port the admin API (create/remove keys remotely)
+# will listen on. Must differ from DOH_PORT since both bind on this same
+# host. Sets the global ADMIN_PORT variable.
+#
+#   prompt_for_admin_port
+# -----------------------------------------------------------------------------
+prompt_for_admin_port() {
+    while true; do
+        read -rp "Port for the admin API [9443]: " ADMIN_PORT
+        ADMIN_PORT=${ADMIN_PORT:-9443}
+        if ! [[ "$ADMIN_PORT" =~ ^[0-9]+$ ]] || (( ADMIN_PORT < 1 || ADMIN_PORT > 65535 )); then
+            echo "Invalid port, try again."
+            continue
+        fi
+        if [ "$ADMIN_PORT" = "$DOH_PORT" ]; then
+            echo "Admin port can't be the same as the DoH port (${DOH_PORT}). Try again."
+            continue
+        fi
+        break
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Usage: generates a random 64-character bearer token for the admin API and
+# stores it in the global ADMIN_TOKEN variable. This is the only credential
+# the main VPS needs to create/remove keys on this server remotely — treat
+# it like a password.
+#
+#   generate_admin_token
+# -----------------------------------------------------------------------------
+generate_admin_token() {
+    ADMIN_TOKEN=$(openssl rand -hex 32)
+}
+
+# -----------------------------------------------------------------------------
 # Usage: prompts for MySQL connection details used by db.js/keys.js.
 # Leaves password entry hidden from terminal echo.
 #
@@ -144,6 +180,8 @@ write_env_file() {
     cat > "$ENV_FILE" <<EOF
 DNS_DOMAIN=${DOMAIN}
 DOH_PORT=${DOH_PORT}
+ADMIN_PORT=${ADMIN_PORT}
+ADMIN_TOKEN=${ADMIN_TOKEN}
 DB_HOST=${DB_HOST}
 DB_NAME=${DB_NAME}
 DB_USER=${DB_USER}
@@ -224,8 +262,9 @@ configure_firewall() {
     ufw allow 22/tcp
     ufw allow 80/tcp
     ufw allow "${DOH_PORT}/tcp"
+    ufw allow "${ADMIN_PORT}/tcp"
     ufw --force enable
-    echo "Firewall rules applied: 22, 80, ${DOH_PORT} open"
+    echo "Firewall rules applied: 22, 80, ${DOH_PORT}, ${ADMIN_PORT} open"
 }
 
 # -----------------------------------------------------------------------------
@@ -324,9 +363,31 @@ EnvironmentFile=${project_dir}/.env
 WantedBy=multi-user.target
 EOF
 
+    # NOTE ON RUNNING AS ROOT: since this project lives in /root (mode 700
+    # by default), a dedicated non-root service user couldn't read these
+    # files without either loosening /root's permissions or moving the
+    # project to a shared path like /opt/royaldns. Both are real hardening
+    # options worth doing before this is customer-facing at scale — this
+    # script doesn't do it automatically so it doesn't silently change your
+    # server layout. Ask if you want that migration done.
+    cat > /etc/systemd/system/royaldns-admin.service <<EOF
+[Unit]
+Description=Royal DNS admin API (remote key create/remove)
+After=network.target mysql.service
+
+[Service]
+WorkingDirectory=${project_dir}
+ExecStart=$(command -v node) admin-api.js
+Restart=always
+EnvironmentFile=${project_dir}/.env
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
     systemctl daemon-reload
-    systemctl enable --now royaldns-server royaldns-bot
-    echo "Services enabled: royaldns-server, royaldns-bot"
+    systemctl enable --now royaldns-server royaldns-bot royaldns-admin
+    echo "Services enabled: royaldns-server, royaldns-bot, royaldns-admin"
     echo "Check status with: systemctl status royaldns-server"
 }
 
@@ -339,6 +400,8 @@ main() {
     check_required_files
     prompt_for_domain
     prompt_for_port
+    prompt_for_admin_port
+    generate_admin_token
     prompt_for_mysql
     write_env_file
     install_system_packages
@@ -349,10 +412,63 @@ main() {
     install_systemd_services
     install_renewal_timer
 
-    step "Setup complete"
-    echo "Server:  https://${DOMAIN}:${DOH_PORT}/<key>"
-    echo "Test it: ./test/test-dns.sh ${DOMAIN} ${DOH_PORT} <a-valid-key>"
-    echo "Edit config anytime with: vi ${ENV_FILE}"
+    print_summary_banner
+}
+
+# -----------------------------------------------------------------------------
+# Usage: prints the final install summary — domain, ports, admin token, ready
+# -to-run curl examples, and where to find logs. Called once at the very end
+# of main(). Not meant to be called standalone (relies on globals set by the
+# prompt_for_* functions above).
+# -----------------------------------------------------------------------------
+print_summary_banner() {
+    local line
+    line=$(printf '═%.0s' {1..79})
+
+    echo
+    echo "$line"
+    echo " ROYAL DNS SERVER INSTALLED"
+    echo "$line"
+    echo
+    echo "Domain:            https://${DOMAIN}"
+    echo "DoH port:          ${DOH_PORT}   (customer key URLs use this)"
+    echo "Admin API port:    ${ADMIN_PORT}"
+    echo "Bearer Token:      ${ADMIN_TOKEN}"
+    echo
+    echo "Create a key (example):"
+    echo "  curl -X POST https://${DOMAIN}:${ADMIN_PORT}/create \\"
+    echo "    -H \"Authorization: Bearer ${ADMIN_TOKEN}\" \\"
+    echo "    -H \"Content-Type: application/json\" \\"
+    echo "    -d '{\"telegramId\": 123456789, \"days\": 30}'"
+    echo
+    echo "Remove a key (example):"
+    echo "  curl -X POST https://${DOMAIN}:${ADMIN_PORT}/remove \\"
+    echo "    -H \"Authorization: Bearer ${ADMIN_TOKEN}\" \\"
+    echo "    -H \"Content-Type: application/json\" \\"
+    echo "    -d '{\"key\": \"a1A10A4qQmNCh3GgcL0e2w\"}'"
+    echo
+    echo "List keys (example):"
+    echo "  curl https://${DOMAIN}:${ADMIN_PORT}/list \\"
+    echo "    -H \"Authorization: Bearer ${ADMIN_TOKEN}\""
+    echo
+    echo "Test the DoH server:"
+    echo "  ./test/test-dns.sh ${DOMAIN} ${DOH_PORT} <a-valid-key>"
+    echo
+    echo "Logs:"
+    echo "  DoH server:  journalctl -u royaldns-server -f"
+    echo "  Admin API:   journalctl -u royaldns-admin -f"
+    echo "  Bot:         journalctl -u royaldns-bot -f"
+    echo
+    echo "Security notes:"
+    echo "  - Keep the bearer token secret — it's the only thing gating /create and /remove"
+    echo "  - HTTPS is automatic via Let's Encrypt (auto-renews daily, see royaldns-renew.timer)"
+    echo "  - All three services currently run as root (see the note above"
+    echo "    install_systemd_services in this script for why, and how to change it)"
+    echo "  - If this is a REGIONAL server (not your main bot server), stop the bot:"
+    echo "      systemctl stop royaldns-bot && systemctl disable royaldns-bot"
+    echo "  - Edit config anytime with: vi ${ENV_FILE}"
+    echo
+    echo "$line"
 }
 
 main
