@@ -3,15 +3,18 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 const axios   = require('axios');
-const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
-const db      = require('./db');
-const mysql   = require('mysql');
 const fs      = require('fs');
-const https   = require('https');
 const tokens  = require('./tokens');
+const regions = require('./regions'); // maps each speed_xxx button to a regional server
+const db      = require('./db'); // local bookkeeping database (this box only — never a regional server)
 
-console.log("✅ MySQL module loaded successfully");
+// ───── Remember which region each chat picked ─────────────────────────────
+// The country is chosen one step before the duration/price, so this bridges
+// the two callback_query events for the same chat. In-memory only — fine
+// for this bot's short-lived flow, but it resets on a bot restart, so a
+// customer mid-flow during a deploy would need to pick their country again.
+const chatRegion = new Map();
 
 // ───── Load / watch callbacks.json ───────────────────────────────────────
 let callbackToServer = {};
@@ -196,7 +199,9 @@ bot.on('callback_query', async (query) => {
 
         // ── Country selected → go to Duration ───────────────────────────
         if (data.startsWith('speed_')) {
-            const countryCode = data.replace('speed_', '').toUpperCase();
+            const region = regions[data];
+            chatRegion.set(chatId, data);
+
             await bot.editMessageText(
                 subMenus.sub_android_duration.text,
                 {
@@ -206,7 +211,7 @@ bot.on('callback_query', async (query) => {
                     reply_markup: subMenus.sub_android_duration.reply_markup
                 }
             );
-            await bot.answerCallbackQuery(query.id, { text: `${countryCode} selected` });
+            await bot.answerCallbackQuery(query.id, { text: `${region ? region.name : data} selected` });
             return;
         }
 
@@ -220,10 +225,75 @@ bot.on('callback_query', async (query) => {
                 '6': '$4.00 ($0.67/mo) Long-term',
                 '12': '$7.00 ($0.58/mo) Best value'
             };
+
+            const regionKey = chatRegion.get(chatId);
+            const region = regionKey && regions[regionKey];
+
+            if (!region) {
+                // Either the customer skipped the country step somehow, or
+                // this region isn't filled in yet in regions.js.
+                await bot.editMessageText(
+                    "⚠️ Please choose a country first.",
+                    {
+                        chat_id: chatId,
+                        message_id: messageId,
+                        reply_markup: { inline_keyboard: [[{ text: 'Choose a country', callback_data: 'sub_android' }]] }
+                    }
+                );
+                await bot.answerCallbackQuery(query.id, { text: 'Pick a country first' });
+                return;
+            }
+
+            // Call that region's admin API remotely to actually create the
+            // key — this box never talks to a regional server's keys.js or
+            // file storage directly, only over HTTPS through its admin API.
+            let issued;
+            try {
+                const response = await axios.post(
+                    `https://${region.domain}:${region.adminPort}/create`,
+                    { telegramId: query.from.id, days: Number(months) * 30 },
+                    {
+                        headers: {
+                            Authorization: `Bearer ${region.adminToken}`,
+                            'Content-Type': 'application/json'
+                        },
+                        timeout: 10000
+                    }
+                );
+                issued = response.data;
+            } catch (err) {
+                console.error(`Failed to create key on ${region.name} (${region.domain}):`, err.message);
+                await bot.editMessageText(
+                    `⚠️ ${region.name}'s server is temporarily unavailable. Please try again shortly, or pick a different country.`,
+                    {
+                        chat_id: chatId,
+                        message_id: messageId,
+                        reply_markup: { inline_keyboard: [[{ text: 'Choose a country', callback_data: 'sub_android' }]] }
+                    }
+                );
+                await bot.answerCallbackQuery(query.id, { text: 'Server unavailable, try again' });
+                return;
+            }
+
+            // Record this in the LOCAL bookkeeping database (this box's own
+            // MySQL, never reached by any regional server) for support/audit
+            // purposes — e.g. a future "My Keys" menu, or looking up which
+            // region a customer's key belongs to. A failure here shouldn't
+            // stop the customer from getting the key they already paid for,
+            // so it's logged rather than blocking the response.
+            try {
+                await db.query(
+                    'INSERT INTO issued_keys (key_value, telegram_id, region, expires_at) VALUES (?, ?, ?, ?)',
+                    [issued.key, query.from.id, regionKey, new Date(issued.expiresAt)]
+                );
+            } catch (err) {
+                console.error('Failed to log issued key to local bookkeeping DB:', err.message);
+            }
+
             await bot.editMessageText(
-                `You selected **${months} Month${months === '1' ? '' : 's'}** plan for **${pricing[months]}**!\n\n` +
-                "Generating your DNS key...\n\n" +
-                "`https://dns.royalgaming.com/dns-query` (Intra App)\n\n" +
+                `You selected **${months} Month${months === '1' ? '' : 's'}** plan for **${pricing[months]}** (${region.name})!\n\n` +
+                "Your DNS key is ready:\n\n" +
+                `\`${issued.dohUrl}\`\n\n` +
                 `Key will expire in ${months * 30} days.`,
                 {
                     chat_id: chatId,
