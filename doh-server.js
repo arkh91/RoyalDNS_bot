@@ -2,10 +2,11 @@
 //  doh-server.js  –  DNS-over-HTTPS endpoint, gated by customer keys
 // ─────────────────────────────────────────────────────────────────────────────
 //
-//  Run this as its own process (pm2/systemd), separate from the Telegram bot.
-//  It listens on 443, checks the caller's key, then forwards the raw DNS
-//  wire-format query to an upstream resolver (Cloudflare here — swap for
-//  your own filtering resolver if you have one).
+//  Run this as its own process (systemd), separate from the Telegram bot —
+//  the bot only runs on the main VPS; this runs on every regional VPS.
+//  Listens on DOH_PORT (from .env), checks the caller's key, then forwards
+//  the raw DNS wire-format query to an upstream resolver (Cloudflare here —
+//  swap for your own filtering resolver if you have one).
 //
 //  npm install express https axios
 //
@@ -71,8 +72,8 @@ app.all('/:key', async (req, res) => {
 /**
  * Usage: entry point — call this once to start listening. Kept separate from
  * top-level code so test scripts can import the server without starting it.
- * Listens on DOH_PORT (from .env, set by setup.sh) rather than a hardcoded
- * 443, since IP mode commonly uses a non-standard port.
+ * Listens on DOH_PORT (from .env, set by setup.sh) — always a custom port
+ * chosen at setup time, since the key lives in the path, not the port.
  *
  *   if (require.main === module) startServer();
  */
