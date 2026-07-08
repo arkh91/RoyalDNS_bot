@@ -3,11 +3,15 @@
 #  setup.sh  -  Royal DNS server provisioning
 # -----------------------------------------------------------------------------
 #
-#  Run this ONCE on a fresh Ubuntu server (root or sudo) before deploying
-#  tls.js / keys.js / doh-server.js / admin-api.js. Asks for your domain and
-#  two ports (DoH + admin API), then installs everything and gets the box
-#  ready to serve DoH, issue/revoke keys locally, and issue/revoke keys
-#  remotely via a bearer-token-protected API. Generated keys look like:
+#  Run this ONCE on a fresh REGIONAL Ubuntu server (root or sudo) — NOT the
+#  main VPS running the Telegram bot, which uses setup-main.sh instead.
+#  Deploys tls.js / keys.js / doh-server.js / admin-api.js. Asks for your
+#  domain and two ports (DoH + admin API), then installs everything and
+#  gets the box ready to serve DoH and issue/revoke keys via a bearer-
+#  token-protected API. No database anywhere on this server — keys live
+#  in a local JSON file (see keys.js); the only database in this whole
+#  system is on the main VPS, purely for its own bookkeeping. Generated
+#  keys look like:
 #    https://dns.royalgaming.com:11111/a1A10A4qQmNCh3GgcL0e2w
 #  which is what you hand to Intra (Android) users. Windows/iPhone/Mac
 #  clients are a separate step - come back to this once Android works.
@@ -151,27 +155,10 @@ generate_admin_token() {
 }
 
 # -----------------------------------------------------------------------------
-# Usage: prompts for MySQL connection details used by db.js/keys.js.
-# Leaves password entry hidden from terminal echo.
-#
-#   prompt_for_mysql
-# -----------------------------------------------------------------------------
-prompt_for_mysql() {
-    step "MySQL connection details"
-    read -rp "MySQL host [127.0.0.1]: " DB_HOST
-    DB_HOST=${DB_HOST:-127.0.0.1}
-    read -rp "MySQL database name [royaldns]: " DB_NAME
-    DB_NAME=${DB_NAME:-royaldns}
-    read -rp "MySQL user [royaldns]: " DB_USER
-    DB_USER=${DB_USER:-royaldns}
-    read -rsp "MySQL password: " DB_PASS
-    echo
-}
-
-# -----------------------------------------------------------------------------
 # Usage: writes all collected values to .env (chmod 600). tls.js/keys.js/
 # doh-server.js all load this via require('dotenv').config() - edit later
-# with `vi .env` if anything changes.
+# with `vi .env` if anything changes. No DB_* values at all — this server
+# has no database, keys live in a local JSON file (see keys.js).
 #
 #   write_env_file
 # -----------------------------------------------------------------------------
@@ -182,10 +169,6 @@ DNS_DOMAIN=${DOMAIN}
 DOH_PORT=${DOH_PORT}
 ADMIN_PORT=${ADMIN_PORT}
 ADMIN_TOKEN=${ADMIN_TOKEN}
-DB_HOST=${DB_HOST}
-DB_NAME=${DB_NAME}
-DB_USER=${DB_USER}
-DB_PASS=${DB_PASS}
 EOF
     chmod 600 "$ENV_FILE"
     echo "Wrote $ENV_FILE (permissions locked to 600)"
@@ -195,14 +178,15 @@ EOF
 # -----------------------------------------------------------------------------
 # Usage: installs Node.js 20 LTS + system packages this project needs
 # (build tools for native modules, dnsutils/knot-dnsutils for testing, ufw
-# for the firewall step). Idempotent - safe to re-run.
+# for the firewall step). No MySQL at all — this server has no database,
+# keys live in a local JSON file. Idempotent - safe to re-run.
 #
 #   install_system_packages
 # -----------------------------------------------------------------------------
 install_system_packages() {
     step "Installing system packages"
     apt-get update -y
-    apt-get install -y curl dnsutils knot-dnsutils ufw mysql-server build-essential vim
+    apt-get install -y curl dnsutils knot-dnsutils ufw build-essential vim
 
     if ! command -v node &> /dev/null; then
         curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
@@ -220,34 +204,8 @@ install_system_packages() {
 install_node_packages() {
     step "Installing npm packages"
     [ -f package.json ] || npm init -y > /dev/null
-    npm install express https axios acme-client dotenv mysql2 node-telegram-bot-api
+    npm install express https axios acme-client dotenv
     echo "Node packages installed"
-}
-
-# -----------------------------------------------------------------------------
-# Usage: creates the MySQL database, user, and dns_keys table if they don't
-# already exist. Safe to re-run (uses IF NOT EXISTS throughout).
-#
-#   setup_database
-# -----------------------------------------------------------------------------
-setup_database() {
-    step "Setting up MySQL database"
-    mysql -u root <<SQL
-CREATE DATABASE IF NOT EXISTS ${DB_NAME};
-CREATE USER IF NOT EXISTS '${DB_USER}'@'${DB_HOST}' IDENTIFIED BY '${DB_PASS}';
-GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'${DB_HOST}';
-FLUSH PRIVILEGES;
-USE ${DB_NAME};
-CREATE TABLE IF NOT EXISTS dns_keys (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  key_value VARCHAR(64) UNIQUE NOT NULL,
-  telegram_id BIGINT NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  expires_at DATETIME NOT NULL,
-  revoked TINYINT(1) DEFAULT 0
-);
-SQL
-    echo "Database '${DB_NAME}' and dns_keys table ready"
 }
 
 # -----------------------------------------------------------------------------
@@ -336,26 +294,12 @@ install_systemd_services() {
     cat > /etc/systemd/system/royaldns-server.service <<EOF
 [Unit]
 Description=Royal DNS DoH server
-After=network.target mysql.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 WorkingDirectory=${project_dir}
 ExecStart=$(command -v node) doh-server.js
-Restart=always
-EnvironmentFile=${project_dir}/.env
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    cat > /etc/systemd/system/royaldns-bot.service <<EOF
-[Unit]
-Description=Royal DNS Telegram bot
-After=network.target mysql.service
-
-[Service]
-WorkingDirectory=${project_dir}
-ExecStart=$(command -v node) main.js
 Restart=always
 EnvironmentFile=${project_dir}/.env
 
@@ -373,7 +317,8 @@ EOF
     cat > /etc/systemd/system/royaldns-admin.service <<EOF
 [Unit]
 Description=Royal DNS admin API (remote key create/remove)
-After=network.target mysql.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 WorkingDirectory=${project_dir}
@@ -386,8 +331,8 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now royaldns-server royaldns-bot royaldns-admin
-    echo "Services enabled: royaldns-server, royaldns-bot, royaldns-admin"
+    systemctl enable --now royaldns-server royaldns-admin
+    echo "Services enabled: royaldns-server, royaldns-admin"
     echo "Check status with: systemctl status royaldns-server"
 }
 
@@ -402,11 +347,9 @@ main() {
     prompt_for_port
     prompt_for_admin_port
     generate_admin_token
-    prompt_for_mysql
     write_env_file
     install_system_packages
     install_node_packages
-    setup_database
     configure_firewall
     request_certificate
     install_systemd_services
@@ -457,15 +400,15 @@ print_summary_banner() {
     echo "Logs:"
     echo "  DoH server:  journalctl -u royaldns-server -f"
     echo "  Admin API:   journalctl -u royaldns-admin -f"
-    echo "  Bot:         journalctl -u royaldns-bot -f"
     echo
     echo "Security notes:"
     echo "  - Keep the bearer token secret — it's the only thing gating /create and /remove"
     echo "  - HTTPS is automatic via Let's Encrypt (auto-renews daily, see royaldns-renew.timer)"
-    echo "  - All three services currently run as root (see the note above"
-    echo "    install_systemd_services in this script for why, and how to change it)"
-    echo "  - If this is a REGIONAL server (not your main bot server), stop the bot:"
-    echo "      systemctl stop royaldns-bot && systemctl disable royaldns-bot"
+    echo "  - Both services currently run as root (see the note above install_systemd_services"
+    echo "    in this script for why, and how to change it)"
+    echo "  - This server has NO database of any kind — keys live in ./data/keys-data.json"
+    echo "  - This script is for REGIONAL servers only — the bot goes on the main VPS via"
+    echo "    setup-main.sh instead, and doesn't belong here"
     echo "  - Edit config anytime with: vi ${ENV_FILE}"
     echo
     echo "$line"
