@@ -45,6 +45,25 @@ check_required_files() {
         exit 1
     fi
 }
+# -----------------------------------------------------------------------------
+# dig should be installed 
+# -----------------------------------------------------------------------------
+install_dnsutils() {
+    # Check if 'dig' is already available
+    if command -v dig &> /dev/null; then
+        echo "dnsutils (dig) is already installed."
+        return 0
+    fi
+
+    # Check if 'apt' is the package manager
+    if command -v apt &> /dev/null; then
+        echo "dig not found. Updating package lists and installing dnsutils..."
+        sudo apt update && sudo apt install -y dnsutils
+    else
+        echo "Error: 'dig' is missing and 'apt' package manager was not found." >&2
+        return 1
+    fi
+}
 
 # -----------------------------------------------------------------------------
 # Usage: prints a message in a consistent "step" style so the script's output
@@ -342,6 +361,7 @@ EOF
 # -----------------------------------------------------------------------------
 main() {
     step "Royal DNS server setup"
+    install_dnsutils()
     check_required_files
     prompt_for_domain
     prompt_for_port
