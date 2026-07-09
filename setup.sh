@@ -361,7 +361,7 @@ EOF
 # -----------------------------------------------------------------------------
 main() {
     step "Royal DNS server setup"
-    install_dnsutils()
+    install_dnsutils
     check_required_files
     prompt_for_domain
     prompt_for_port
