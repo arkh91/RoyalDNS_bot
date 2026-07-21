@@ -9,7 +9,7 @@ mkdir -p main-vps && cp main.js db.js regions.example.js tokens.example.js setup
 ## Regional:
 
 ```
-mkdir -p RoyalVPN && cd RoyalVPN
+mkdir -p RoyalDNS && cd RoyalDNS
 wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/setup.sh && chmod +x setup.sh
 wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/tls.js
 wget https://raw.githubusercontent.com/arkh91/RoyalDNS_bot/refs/heads/main/keys.js
